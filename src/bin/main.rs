@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
-use mq::{Commands, Queue};
+use mq::Queue;
+use mq::{decode, Message};
 use std::io;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};

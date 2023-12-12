@@ -24,7 +24,6 @@ fn main() -> Result<()> {
             }
             Err(e) => {
                 eprintln!("Error accepting connection: {}", e);
-                // You may choose to break the loop or continue depending on your use case.
             }
         }
     }

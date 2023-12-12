@@ -1,8 +1,5 @@
-#![allow(dead_code, unused_variables)]
-use crate::Queue;
-use minicbor::{decode::Error, Decode, Decoder, Encode};
-use std::collections::{HashMap, HashSet};
-use std::{fmt::Display, io::Write, net::TcpStream};
+use minicbor::{decode::Error, Decode, Encode};
+use std::fmt::Display;
 #[derive(Debug)]
 #[repr(u8)]
 pub enum Commands {
@@ -61,10 +58,6 @@ impl<'a> Message<'a> {
     pub fn encode(&self, buffer: &mut [u8]) {
         minicbor::encode(self, buffer).unwrap();
     }
-    pub fn decode(self, buffer: &'a mut [u8]) -> Message<'a> {
-        minicbor::decode(buffer).unwrap()
-    }
-    pub fn exec(&mut self) {}
 }
 
 impl<'a> Default for Message<'a> {

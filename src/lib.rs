@@ -1,10 +1,8 @@
-#![allow(unused_imports)]
-use core::time::Duration;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::result;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 pub mod internal;
 
 pub use crate::internal::messages::*;

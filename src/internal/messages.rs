@@ -1,10 +1,12 @@
-#![allow(dead_code)]
-use minicbor::{Decode, Encode};
-use std::fmt::Display;
-
+#![allow(dead_code, unused_variables)]
+use crate::Queue;
+use minicbor::{decode::Error, Decode, Decoder, Encode};
+use std::collections::{HashMap, HashSet};
+use std::{fmt::Display, io::Write, net::TcpStream};
 #[derive(Debug)]
 #[repr(u8)]
 pub enum Commands {
+    QUIT = 0,
     SUBSCRIBE = 1,
     PUBLISH = 2,
     ACK = 3,
@@ -28,14 +30,17 @@ impl Commands {
 
     pub fn from_u8(value: u8) -> Commands {
         match value {
+            0 => Commands::QUIT,
             1 => Commands::SUBSCRIBE,
             2 => Commands::PUBLISH,
+            3 => Commands::ACK,
+            4 => Commands::NACK,
             _ => Commands::UNKNOWN(format!("Unknown command: {}", value)),
         }
     }
 }
 
-#[derive(Debug, Default, Encode, Decode, PartialEq, Clone)]
+#[derive(Debug, Copy, Encode, Decode, PartialEq, Clone)]
 pub struct Message<'a> {
     #[n(0)]
     pub command: Option<u8>,
@@ -43,6 +48,7 @@ pub struct Message<'a> {
     pub queue: Option<&'a str>,
     #[cbor(n(2), with = "minicbor::bytes")]
     pub message: Option<&'a [u8]>,
+    //size
 }
 impl<'a> Message<'a> {
     pub fn new(command: u8, queue: &'a str, message: &'a [u8]) -> Message<'a> {
@@ -52,15 +58,29 @@ impl<'a> Message<'a> {
             message: Some(message),
         }
     }
-    pub fn encode(&self, buffer: &mut [u8; 1024]) {
-        minicbor::encode(self, buffer.as_mut()).unwrap();
+    pub fn encode(&self, buffer: &mut [u8]) {
+        minicbor::encode(self, buffer).unwrap();
+    }
+    pub fn decode(self, buffer: &'a mut [u8]) -> Message<'a> {
+        minicbor::decode(buffer).unwrap()
+    }
+    pub fn exec(&mut self) {}
+}
+
+impl<'a> Default for Message<'a> {
+    fn default() -> Self {
+        Message {
+            command: Some(0),
+            queue: None,
+            message: None,
+        }
     }
 }
 
-pub fn decode(buffer: &[u8; 1024]) -> Message<'_> {
-    let output: Message = minicbor::decode(buffer).unwrap();
-    output.to_owned()
+pub fn decode(buffer: &[u8]) -> Result<Message<'_>, Error> {
+    minicbor::decode(buffer)
 }
+
 mod test {
     #![allow(unused_imports)]
     use crate::{decode, Message};
@@ -71,6 +91,6 @@ mod test {
         let mut buffer = [0; 1024];
         message.encode(&mut buffer);
         let output = decode(&buffer);
-        assert_eq!(message, output);
+        assert_eq!(message, output.unwrap());
     }
 }

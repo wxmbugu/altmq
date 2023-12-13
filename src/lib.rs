@@ -36,11 +36,21 @@ impl Server {
                     _ => panic!("Got an error: {}", err),
                 },
             };
-            let message = decode(&buffer[..bytes_read]).unwrap();
-            self.match_command(message);
+            let message = decode(&buffer[..bytes_read]);
+            match message {
+                Ok(message) => {
+                    self.handle_client_command(message);
+                }
+                Err(e) => {
+                    eprintln!("EROR: WRONG MESSAGE FORMAT {e}");
+                    self.stream
+                        .shutdown(std::net::Shutdown::Both)
+                        .expect("shutdown call failed");
+                }
+            }
         }
     }
-    pub fn match_command(&mut self, message: Message) {
+    pub fn handle_client_command(&mut self, message: Message) {
         match Commands::from_u8(message.command.unwrap()) {
             Commands::QUIT => {
                 self.stream
@@ -65,6 +75,7 @@ impl Server {
                             .try_write()
                             .unwrap()
                             .insert(name.to_string(), queue);
+                        println!("INFO: PUBLISHED A MESSAGE TO TOPIC:{name}");
                     }
                 }
             }

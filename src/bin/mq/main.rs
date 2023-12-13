@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, RwLock};
 
-const PORT: &str = "8000";
+const PORT: u32 = 8000;
 const BUFFER: usize = 1024;
 fn main() -> Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", PORT)).unwrap();

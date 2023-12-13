@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2021"
 [dependencies]
 minicbor = { version = "0.20.0", features = ["derive"] }
+mio = { version = "0.8.10", features = ["net"] }
 
 [[bin]]
 name = "mq"
 path = "src/bin/mq/main.rs"
 [[bin]]
-name = "publish"
-path = "src/bin/publish/main.rs"
+name = "pub"
+path = "src/bin/pub/main.rs"
+[[bin]]
+name = "sub"
+path = "src/bin/sub/main.rs"

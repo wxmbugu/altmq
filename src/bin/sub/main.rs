@@ -1,50 +1,41 @@
-use core::time::Duration;
-use mq::Message;
-use std::io::prelude::*;
-use std::net::TcpStream;
+#![allow(dead_code)]
+use mq::MessageQueueClient;
+use mq::Result;
+use std::io;
+use std::time::Duration;
+use tokio::sync::mpsc;
 
-fn construct_message<'a>(message: Message<'a>, buffer: &'a mut [u8]) -> &'a mut [u8] {
-    message.encode(buffer);
-    buffer
-}
-
-fn read_messages(stream: &mut TcpStream) -> std::io::Result<()> {
-    let message = Message {
-        command: Some(1),
-        queue: Some("dsfkaslf"),
-        message: None,
-    };
-    let mut buffer = [0; 1024];
-
-    let message_buffer = construct_message(message, &mut buffer);
-    match stream.write_all(message_buffer) {
-        Ok(_) => {
-            match stream.read(&mut buffer) {
-                Ok(result) => {
-                    println!("{:?},{:?}", buffer, result);
-                    Ok(())
-                }
-                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Handle WouldBlock error here
-                    println!("WouldBlock error. Sleeping or retrying...");
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            }
-        }
-        Err(err) => Err(err),
-    }
-}
 static ADDR: &str = "127.0.0.1:8000";
 
-fn main() {
-    let mut stream = TcpStream::connect(ADDR).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(1000)))
-        .unwrap();
+#[tokio::main]
+async fn main() -> Result<(), io::Error> {
+    let mut queue = MessageQueueClient::dial(ADDR).await?;
 
-    // loop {
-    read_messages(&mut stream).unwrap();
-    // std::thread::sleep(std::time::Duration::from_millis(10));
-    // }
+    // Create a channel for receiving notifications
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+
+    // Spawn a task to handle incoming messages
+    tokio::spawn(async move {
+        loop {
+            // Simulate receiving a message
+            // Replace this with your actual logic to check for new messages
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Notify the main task that there is new data
+            if tx.send(()).await.is_err() {
+                // Handle channel send error
+                eprintln!("ERROR: Failed to send notification");
+            }
+        }
+    });
+
+    // Main loop to wait for notifications
+    while rx.recv().await.is_some() {
+        // Perform processing when a notification is received
+        if let Err(err) = queue.subscribe("queue").await {
+            eprintln!("ERROR: Failed to subscribe: {:?}", err);
+        }
+    }
+
+    Ok(())
 }

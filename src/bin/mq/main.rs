@@ -40,15 +40,7 @@ fn handle_incoming_connection(
             }
             Ok(bytes_read) => {
                 let mut server = Server::new(stream.clone(), caches.clone());
-                match server.decode_buffer(&mut buffer[..bytes_read]) {
-                    Ok(_) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("ERROR: Decode error occured: {:?},{:?}", e, buffer);
-                        break;
-                    }
-                }
+                server.decode_buffer(buffer[..bytes_read].to_vec());
             }
             Err(err) => match err.kind() {
                 ErrorKind::WouldBlock => {

@@ -1,10 +1,10 @@
 #![allow(dead_code)]
-use minicbor::decode::Error;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::{io, result, u8};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::time::Duration;
+use tokio::sync::Mutex;
 pub mod internal;
 
 pub use crate::internal::messages::*;
@@ -37,25 +37,16 @@ impl Server {
             client: HashMap::new(),
         }
     }
-    pub fn decode_buffer(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+    pub fn decode_buffer(&mut self, buffer: Vec<u8>) {
         let message = decode(buffer);
-        match message {
-            Ok(message) => {
-                self.handle_client_command(message);
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("ERROR: WRONG MESSAGE FORMAT {:?}", e);
-                Err(e)
-            }
-        }
+        self.handle_client_command(message);
     }
     pub fn handle_client_command(&mut self, message: Message) {
         match Commands::from_u8(message.command.unwrap()) {
             Commands::QUIT => {}
             Commands::SUBSCRIBE => {
                 if let Some(name) = message.queue {
-                    if let Some(queue) = self.jobs.read().unwrap().get(name) {
+                    if let Some(queue) = self.jobs.read().unwrap().get(&name) {
                         for messages in queue {
                             let mut data: Vec<u8> = vec![];
                             data.push(messages.len() as u8);
@@ -91,37 +82,37 @@ impl Server {
 }
 
 pub struct MessageQueueClient {
-    stream: Arc<TcpStream>,
+    stream: Arc<Mutex<TcpStream>>,
 }
 
 impl MessageQueueClient {
     pub async fn dial(server_address: &str) -> Result<MessageQueueClient, io::Error> {
-        let stream = Arc::new(TcpStream::connect(server_address).await?);
+        let stream = Arc::new(Mutex::new(TcpStream::connect(server_address).await?));
         Ok(Self { stream })
     }
 
-    pub fn publish(&mut self, queue_name: &str, message: &[u8]) -> Result<(), io::Error> {
-        let message = Message::new(2, queue_name, message);
-        let mut buffer = [0; 1024];
-        self.send_message(message, &mut buffer)
+    pub async fn publish(&mut self, queue_name: &str, message: &[u8]) -> Result<(), io::Error> {
+        let message = Message::new(2, queue_name.to_string(), message.to_vec());
+        self.send_message(message).await
     }
     pub async fn subscribe(&mut self, queue_name: &str) -> Result<(), std::io::Error> {
         let stream = self.stream.clone();
-        let message = Message::new(1, queue_name, &[]);
+        let message = Message::new(1, queue_name.to_string(), [].to_vec());
         let mut buffer = [0; 1024];
 
-        match self.send_message(message, &mut buffer) {
+        match self.send_message(message).await {
             Ok(()) => {
                 tokio::spawn(async move {
                     loop {
-                        match stream.try_read(&mut buffer[..1]) {
+                        let mut stream_lock = stream.lock().await;
+                        match stream_lock.try_read(&mut buffer[..1]) {
                             Ok(0) => {
                                 println!("INFO: Connection closed by the server");
                                 break;
                             }
                             Ok(_bytes_read) => {
                                 let length = buffer[0] as usize;
-                                match stream.try_read(&mut buffer[..length]) {
+                                match read(&mut stream_lock, &mut buffer[..length]).await {
                                     Ok(message_length) => {
                                         let received_data =
                                             String::from_utf8_lossy(&buffer[..message_length]);
@@ -129,7 +120,6 @@ impl MessageQueueClient {
                                     }
                                     Err(err) => {
                                         if err.kind() == std::io::ErrorKind::WouldBlock {
-                                            tokio::time::sleep(Duration::from_secs(5)).await;
                                             continue;
                                         }
                                     }
@@ -137,7 +127,6 @@ impl MessageQueueClient {
                             }
                             Err(err) => {
                                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
                                     continue;
                                 } else {
                                     eprintln!("ERROR: An unexpected error occurred: {:?}", err);
@@ -153,21 +142,13 @@ impl MessageQueueClient {
             Err(err) => Err(err),
         }
     }
-    // async fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    //     let result = self.stream.read_exact(buf).await;
-    //     if let Err(error) = result {
-    //         return Err(error);
-    //     }
-    //
-    //     Ok(result.unwrap())
-    // }
-    fn send_message(&self, message: Message<'_>, buffer: &mut [u8]) -> Result<(), std::io::Error> {
-        let message_buffer = construct_message(message.to_owned(), buffer);
-        match self.stream.try_write(message_buffer) {
+    async fn send_message(&self, message: Message) -> Result<(), std::io::Error> {
+        let message_buffer = construct_message(message);
+
+        match self.stream.lock().await.try_write(&message_buffer) {
             Ok(_n) => Ok(()),
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // Handle WouldBlock error here
                     Err(err)
                 } else {
                     eprintln!("ERROR: Failed to write to stream: {:?}", err);
@@ -177,7 +158,10 @@ impl MessageQueueClient {
         }
     }
 }
-fn construct_message<'a>(message: Message<'a>, buffer: &'a mut [u8]) -> &'a mut [u8] {
-    message.encode(buffer);
-    buffer
+pub async fn read(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<usize, io::Error> {
+    let read_bytes = stream.read_exact(buffer).await?;
+    Ok(read_bytes)
+}
+fn construct_message(message: Message) -> Vec<u8> {
+    message.encode().to_vec()
 }

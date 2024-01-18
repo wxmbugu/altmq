@@ -8,6 +8,6 @@ static ADDR: &str = "127.0.0.1:8000";
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
     let mut queue = MessageQueueClient::dial(ADDR).await?;
-    queue.publish("queue", b"Hello World").unwrap();
+    queue.publish("queue", b"Hello World!").await.unwrap();
     Ok(())
 }

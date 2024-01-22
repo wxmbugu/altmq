@@ -1,10 +1,10 @@
-#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::{io, result, u8};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+
 pub mod internal;
 
 pub use crate::internal::messages::*;
@@ -15,16 +15,13 @@ pub type Result<T, E> = result::Result<T, E>;
 #[derive(Debug)]
 pub struct Server {
     pub stream: Arc<TcpStream>,
-    pub client: HashMap<i32, Client>,
+    // pub client: HashMap<i32, Client>,
     pub jobs: Arc<RwLock<HashMap<String, HashSet<Vec<u8>>>>>,
 }
 
 #[derive(Debug)]
 pub struct Client {
     pub ip: String,
-}
-unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
-    ::core::slice::from_raw_parts((p as *const T) as *const u8, ::core::mem::size_of::<T>())
 }
 impl Server {
     pub fn new(
@@ -34,7 +31,7 @@ impl Server {
         Server {
             stream,
             jobs,
-            client: HashMap::new(),
+            // client: HashMap::new(),
         }
     }
     pub fn decode_buffer(&mut self, buffer: Vec<u8>) {
@@ -46,14 +43,16 @@ impl Server {
             Commands::QUIT => {}
             Commands::SUBSCRIBE => {
                 if let Some(name) = message.queue {
-                    if let Some(queue) = self.jobs.read().unwrap().get(&name) {
-                        for messages in queue {
+                    if let Some(mut queue) = self.jobs.write().unwrap().remove(&name) {
+                        for messages in &queue {
                             let mut data: Vec<u8> = vec![];
                             data.push(messages.len() as u8);
                             data.append(&mut messages.to_owned());
                             self.stream.try_write(&data).unwrap();
-                            println!("INFO: RECEIVED MESSAGE TO TOPIC:{name}");
+
+                            println!("INFO: RECEIVED MESSAGE TO TOPIC: {}", name);
                         }
+                        queue.clear();
                     }
                 }
             }
@@ -79,6 +78,9 @@ impl Server {
             }
         }
     }
+    pub fn reset(&mut self) {
+        self.jobs = Arc::new(RwLock::new(HashMap::new()));
+    }
 }
 
 pub struct MessageQueueClient {
@@ -99,7 +101,6 @@ impl MessageQueueClient {
         let stream = self.stream.clone();
         let message = Message::new(1, queue_name.to_string(), [].to_vec());
         let mut buffer = [0; 1024];
-
         match self.send_message(message).await {
             Ok(()) => {
                 tokio::spawn(async move {

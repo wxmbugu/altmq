@@ -2,13 +2,12 @@ use std::fmt::Display;
 
 use serde_derive::{Deserialize, Serialize};
 #[derive(Debug)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum Commands {
     QUIT = 0,
     SUBSCRIBE = 1,
     PUBLISH = 2,
-    ACK = 3,
-    NACK = 4,
+    PING = 3,
     UNKNOWN(String),
 }
 
@@ -26,13 +25,11 @@ impl Commands {
         None
     }
 
-    pub fn from_u8(value: u8) -> Commands {
+    pub fn from_u8(value: u32) -> Commands {
         match value {
             0 => Commands::QUIT,
             1 => Commands::SUBSCRIBE,
             2 => Commands::PUBLISH,
-            3 => Commands::ACK,
-            4 => Commands::NACK,
             _ => Commands::UNKNOWN(format!("Unknown command: {}", value)),
         }
     }

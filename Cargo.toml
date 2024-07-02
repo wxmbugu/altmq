@@ -8,6 +8,8 @@ tokio = { version = "1.35.1", features = ["full"] }
 serde = "1.0"
 serde_derive = "1.0"
 memmap2 = "0.9.4"
+log = "0.4"
+
 [[bin]]
 name = "mq"
 path = "src/bin/mq/main.rs"

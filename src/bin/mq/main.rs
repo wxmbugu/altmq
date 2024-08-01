@@ -2,6 +2,7 @@ use mq::{Result, Server};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::sync::{Arc, RwLock};
+use std::usize;
 use tokio::net::{TcpListener, TcpStream};
 
 const PORT: u32 = 8000;
@@ -17,7 +18,7 @@ async fn main() -> Result<(), io::Error> {
             Ok((stream, _addr)) => {
                 let caches_clone = Arc::clone(&caches);
                 tokio::spawn(async move {
-                    handle_incoming_connection(Arc::new(stream), caches_clone);
+                    handle_incoming_connection(Arc::new(stream), caches_clone).await;
                 });
             }
             Err(e) => {
@@ -27,30 +28,26 @@ async fn main() -> Result<(), io::Error> {
     }
 }
 
-fn handle_incoming_connection(
+async fn handle_incoming_connection(
     stream: Arc<TcpStream>,
     caches: Arc<RwLock<HashMap<String, HashSet<Vec<u8>>>>>,
 ) {
     let mut buffer = [0; BUFFER];
-    loop {
-        match stream.try_read(&mut buffer) {
-            Ok(0) => {
-                println!("INFO: Connection closed by the client");
-                break;
+    match stream.try_read(&mut buffer) {
+        Ok(0) => {
+            println!("INFO: Connection closed by the client");
+        }
+        Ok(bytes_read) => {
+            let mut server = Server::new(stream.clone(), caches.clone());
+            server.decode_buffer(buffer[..bytes_read].to_vec());
+        }
+        Err(err) => match err.kind() {
+            ErrorKind::WouldBlock => {
+                eprintln!("ERROR: Got an unexpected error: {:?}", err);
             }
-            Ok(bytes_read) => {
-                let mut server = Server::new(stream.clone(), caches.clone());
-                server.decode_buffer(buffer[..bytes_read].to_vec());
+            _ => {
+                eprintln!("ERROR: Got an unexpected error: {:?}", err);
             }
-            Err(err) => match err.kind() {
-                ErrorKind::WouldBlock => {
-                    continue;
-                }
-                _ => {
-                    eprintln!("ERROR: Got an unexpected error: {:?}", err);
-                    break;
-                }
-            },
-        };
-    }
+        },
+    };
 }

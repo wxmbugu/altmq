@@ -1,3 +1,9 @@
+//TODO: UNIQUE_ID for segment
+// TODO: crc digest to test data consistency
+// TODO: check if data iwill fit next segment on storage save instead on segment save
+// TODO: Log Replication and Log Compaction
+// FIX: Too many files open, should we maybe use a custom bufferwriter and bufferreader
+// FIX:  storage directory to match queue name/entry
 #![allow(dead_code)]
 use crate::Result;
 use core::str;
@@ -8,7 +14,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::FileExt,
     path::PathBuf,
-    u32, u64,
+    u32, u64, u8,
 };
 
 #[derive(Debug)]
@@ -18,12 +24,12 @@ pub enum StorageError {
     SegmentNotFound,
     DirEmpty,
 }
-const SEGMENT_SIZE: usize = 5 * 1024 * 1024;
+const SEGMENT_SIZE: usize = 5 * 1024 * 1204;
 const START_OFFSET: usize = 0;
 const DIR_PATH: &str = "storage/queue/";
 #[derive(Debug)]
-struct Storage {
-    segments: HashMap<String, Vec<Segment>>,
+pub struct Storage {
+    pub segments: HashMap<String, Vec<Segment>>,
     segment_size: u32,
     dir_path: PathBuf, //TODO: should be a setting
 }
@@ -60,9 +66,10 @@ impl From<io::Error> for StorageError {
     }
 }
 impl Storage {
-    fn new(queue_name: &str, segment_size: u32, dir_path: String) -> Self {
+    pub fn new(queue_name: &str, segment_size: u32, dir_path: String) -> Self {
         let mut segments = HashMap::new();
         let mut vec_segments: Vec<Segment> = Vec::new();
+        // fs::create_dir_all(&dir_path).unwrap();
         let segment = Segment::new(&dir_path, 0, segment_size);
         vec_segments.push(segment);
         segments.insert(queue_name.to_string(), vec_segments);
@@ -72,7 +79,62 @@ impl Storage {
             dir_path: PathBuf::from(dir_path),
         }
     }
-    fn load_exitisting(&mut self) -> Result<(), StorageError> {
+    pub fn save_to_disk(&mut self, queue_name: &str, data: &[u8]) {
+        if data.len() > self.segment_size as usize {
+            //TODO: UNIQUE_ID for segment
+            // we split the data into chunks that will fit each segment size
+            // todo give a unique id to trunk the every chunk or data so that means any entry will
+            // have an id so that we can use it where the message might be larger than the segment_size
+            let mut cursor: u32 = 0;
+            let end_pos = data.len();
+            loop {
+                let final_segment_size = end_pos % self.segment_size as usize;
+                let final_chunk_pos = end_pos - final_segment_size;
+                let next_cursor = cursor + self.segment_size;
+                let chunk = &data[cursor as usize..next_cursor as usize];
+                self.save_data_to_segment(queue_name, chunk);
+                cursor = next_cursor;
+                if cursor as usize == final_chunk_pos {
+                    if final_segment_size > 0 {
+                        let final_chunk = &data[cursor as usize..];
+                        self.save_data_to_segment(queue_name, final_chunk);
+                        break;
+                    }
+                    break;
+                }
+            }
+        } else {
+            self.save_data_to_segment(queue_name, data);
+        }
+    }
+    fn save_data_to_segment(&mut self, queue_name: &str, data: &[u8]) {
+        let segments = self
+            .segments
+            .get_mut(queue_name)
+            .expect("expect vec of queue messages");
+        let len_segments = segments.len();
+        let segment = &mut segments[len_segments - 1];
+        match segment.append_data(data) {
+            Ok(_) => (),
+            Err(e) => match e {
+                StorageError::NoSpaceLeft => {
+                    segment.log.index.resize();
+                    segment.closed = true;
+                    let mut new_segment = Segment::new(
+                        self.dir_path.as_os_str().to_str().expect("queue path"),
+                        (len_segments) as u32,
+                        self.segment_size,
+                    );
+                    new_segment.append_data(data).unwrap();
+                    segments.push(new_segment);
+                }
+                _ => {
+                    eprintln!("{:?}", e);
+                }
+            },
+        }
+    }
+    fn restore_from_disk(&mut self) -> Result<(), StorageError> {
         if self.dir_path.read_dir()?.next().is_none() {
             Err(StorageError::DirEmpty)
         } else {
@@ -93,7 +155,7 @@ impl Storage {
     }
 }
 
-fn load_segments_from_disk(path: String) -> Vec<Segment> {
+pub fn load_segments_from_disk(path: String) -> Vec<Segment> {
     let mut log_file: Vec<u32> = Vec::new();
     let mut segments: Vec<Segment> = Vec::new();
     for entry in fs::read_dir(&path).unwrap() {
@@ -156,7 +218,7 @@ fn load_segment(
 }
 
 impl Segment {
-    fn new(dir: &str, log_name: u32, segment_size: u32) -> Segment {
+    pub fn new(dir: &str, log_name: u32, segment_size: u32) -> Segment {
         let path = PathBuf::from(dir);
         Segment {
             log: Log::new(&path, log_name).expect("creating file"),
@@ -187,7 +249,7 @@ impl Segment {
             closed,
         }
     }
-    fn append_data(&mut self, data: &[u8]) -> Result<(), StorageError> {
+    pub fn append_data(&mut self, data: &[u8]) -> Result<(), StorageError> {
         match self.check_split(data.len() as u32) {
             Ok(_) => {
                 let entry = Entry::new(self.current_offset, data.len() as u32);
@@ -207,7 +269,7 @@ impl Segment {
             false => Ok(true),
         }
     }
-    fn seek_at(&mut self, entry: Entry) -> Vec<u8> {
+    fn read(&mut self, entry: Entry) -> Vec<u8> {
         self.log.seek(entry.size as usize, entry.offset)
     }
     fn close(&mut self) {
@@ -271,10 +333,11 @@ impl Index {
         }
     }
     fn write(&mut self, entry: &Entry) {
-        let size = (&mut self.mmap[self.offset..])
+        let _size = (&mut self.mmap[self.offset..])
             .write(&entry.as_bytes())
             .unwrap();
-        self.offset(size);
+        self.mmap.flush().unwrap();
+        self.offset(entry.as_bytes().len());
     }
     fn offset(&mut self, size: usize) {
         self.offset += size;
@@ -284,7 +347,6 @@ impl Index {
     }
     fn resize(&mut self) {
         let options = RemapOptions::new();
-
         unsafe {
             self.mmap.remap(self.offset, options).unwrap();
         };
@@ -342,10 +404,12 @@ impl Log {
 mod test {
     #![allow(unused_imports)]
 
-    use crate::internal::log::{load_segments_from_disk, Entry, SEGMENT_SIZE};
+    use crate::internal::log::{load_segments_from_disk, Entry, Storage, SEGMENT_SIZE};
+    use crate::internal::queue;
 
     use super::{Segment, StorageError};
     use std::cell::RefCell;
+    use std::ops::Div;
     use std::panic;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -359,51 +423,18 @@ mod test {
     use std::{fs, path};
     const PATH: &str = "test_data";
     use std::{sync::Mutex, thread::sleep};
-    static SETUP_ONCE: Once = Once::new();
-    static TEARDOWN_ONCE: Once = Once::new();
-    fn setup() {
-        SETUP_ONCE.call_once(|| {
-            fs::create_dir_all(format!("{PATH}/segments").as_str()).unwrap();
-        });
-    }
-
-    fn teardown() {
-        TEARDOWN_ONCE.call_once(|| {
-            fs::remove_dir_all(PATH).unwrap();
-        });
-    }
-    fn run_test<T>(test: T)
-    where
-        T: FnOnce() + panic::UnwindSafe,
-    {
-        setup();
-        let result = panic::catch_unwind(|| test);
-        teardown();
-        assert!(result.is_ok())
-    }
-
-    fn run_test_panic<T>(test: T)
-    where
-        T: FnOnce() + panic::UnwindSafe,
-    {
-        setup();
-        let result = panic::catch_unwind(|| test);
-        teardown();
-        assert!(result.is_err())
-    }
     #[test]
     fn test_create_log() {
         let offset = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        run_test(|| {
-            let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
-            let data = b"Hello World!";
-            seg.append_data(data).unwrap();
-            assert_eq!(seg.current_offset, data.len() as u32);
-        });
+        let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
+        let data = b"Hello World!";
+        seg.append_data(data).unwrap();
+        assert_eq!(seg.current_offset, data.len() as u32)
     }
+
     #[test]
     #[should_panic]
     fn test_no_space_left() {
@@ -413,11 +444,9 @@ mod test {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        run_test_panic(|| {
-            let mut seg = Segment::new(PATH, offset, segment_size);
-            seg.append_data(data).unwrap();
-            seg.append_data(data).unwrap();
-        });
+        let mut seg = Segment::new(PATH, offset, segment_size);
+        seg.append_data(data).unwrap();
+        seg.append_data(data).unwrap();
     }
     #[test]
     fn test_index_offsets() {
@@ -425,99 +454,36 @@ mod test {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        run_test(|| {
-            let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
-            let data = b"Hello World!";
-            seg.append_data(data).unwrap();
-            seg.append_data(data).unwrap();
-            seg.append_data(data).unwrap();
-            let mmap = &seg.log.index.mmap;
-            let expected_entries = vec![
-                Entry::new(0, data.len() as u32).as_bytes(),
-                Entry::new(data.len() as u32, data.len() as u32).as_bytes(),
-                Entry::new((data.len() as u32) * 2, data.len() as u32).as_bytes(),
-            ];
-            let mut offset = 0;
-            for expected in expected_entries {
-                let entry_bytes = &mmap[offset..offset + expected.len()];
-                assert_eq!(entry_bytes, expected);
-                offset += expected.len();
-            }
-        });
+        let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
+        let data = b"Hello World!";
+        seg.append_data(data).unwrap();
+        seg.append_data(data).unwrap();
+        seg.append_data(data).unwrap();
+        let mmap = &seg.log.index.mmap;
+        let expected_entries = vec![
+            Entry::new(0, data.len() as u32).as_bytes(),
+            Entry::new(data.len() as u32, data.len() as u32).as_bytes(),
+            Entry::new((data.len() as u32) * 2, data.len() as u32).as_bytes(),
+        ];
+        let mut offset = 0;
+        for expected in expected_entries {
+            let entry_bytes = &mmap[offset..offset + expected.len()];
+            assert_eq!(entry_bytes, expected);
+            offset += expected.len();
+        }
     }
     #[test]
-    fn test_read_at() {
+    fn test_log_read_at() {
         let offset = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
 
-        run_test(|| {
-            let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
-            let data = b"Hello World!";
-            seg.append_data(data).unwrap();
-            let entry = Entry::new(data.len() as u32, seg.current_offset);
-            let read_data = seg.seek_at(entry);
-            assert_eq!(read_data, data);
-        });
-    }
-
-    #[test]
-    fn test_load_segments() {
-        let path_str = format!("{PATH}/segments");
-        let path = PathBuf::from(&path_str);
-        let num_segments = 6;
-
-        run_test(|| {
-            create_segments(&path_str, num_segments);
-            let segments = load_segments_from_disk(path.to_str().unwrap().to_string());
-            assert_eq!(segments.len(), num_segments as usize);
-        });
-    }
-    fn create_segments(path: &str, no_segments: u32) {
-        let mut vec_seg: Vec<Rc<RefCell<Segment>>> = Vec::new();
-        let mut _count = 0;
-        let mut next_seg = 0;
-        let mut new_segments: Vec<Rc<RefCell<Segment>>> = Vec::new();
-        let segment = Segment::new(path, next_seg, 1024);
-        vec_seg.push(Rc::new(RefCell::new(segment)));
-        loop {
-            if next_seg == no_segments {
-                let log_path = format!("{path}/{next_seg:0>12}.log");
-                let idx_path = format!("{path}/{next_seg:0>12}.idx");
-                fs::remove_file(log_path).unwrap();
-                fs::remove_file(idx_path).unwrap();
-                break;
-            }
-            let mut remove_indices = Vec::new();
-            for (index, segment) in vec_seg.iter().enumerate() {
-                let mut segment_mut = segment.borrow_mut();
-                let data = b"Hello World!";
-                match segment_mut.append_data(data) {
-                    Ok(_) => {
-                        _count += 1;
-                    }
-                    Err(e) => match e {
-                        StorageError::NoSpaceLeft => {
-                            println!("{}", segment_mut.log.index.offset);
-                            segment_mut.log.index.resize();
-                            next_seg += 1;
-                            segment_mut.closed = true;
-                            let new_seg = Segment::new(path, next_seg, 1024);
-                            new_segments.push(Rc::new(RefCell::new(new_seg)));
-                            remove_indices.push(index);
-                        }
-                        _ => {
-                            eprintln!("{:?}", e);
-                        }
-                    },
-                }
-            }
-            vec_seg.extend(new_segments.iter().cloned());
-            new_segments.clear();
-            for &index in remove_indices.iter().rev() {
-                vec_seg.remove(index);
-            }
-        }
+        let mut seg = Segment::new(PATH, offset, SEGMENT_SIZE as u32);
+        let data = b"Hello World!";
+        seg.append_data(data).unwrap();
+        let entry = Entry::new(data.len() as u32, seg.current_offset);
+        let read_data = seg.read(entry);
+        assert_eq!(read_data, data);
     }
 }

@@ -2,14 +2,16 @@
 use mq::MessageQueueClient;
 use mq::Result;
 use std::io;
-
-static ADDR: &str = "127.0.0.1:8000";
+static ADDR: &str = "127.0.0.1:9000";
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
+        .expect("setting default subscriber failed");
+
     let mut queue = MessageQueueClient::dial(ADDR).await?;
-    if let Err(err) = queue.subscribe("queue").await {
-        eprintln!("ERROR: Failed to subscribe: {:?}", err);
+    loop {
+        queue.subscribe("adventure").await?;
     }
-    Ok(())
+    // Ok(())
 }

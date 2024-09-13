@@ -1,28 +1,33 @@
-use mq::{Result, Server};
-use std::collections::{HashMap, HashSet};
-use std::io::{self, ErrorKind};
-use std::sync::{Arc, RwLock};
-use std::usize;
+use mq::internal::log::CommitLog;
+use mq::{BinaryHeader, Result, Server};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, ErrorKind, Write};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
-const PORT: u32 = 8000;
+const PORT: u32 = 9000;
 const BUFFER: usize = 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
+        .expect("setting default subscriber failed");
     let listener = TcpListener::bind(format!("127.0.0.1:{}", PORT)).await?;
-    println!("INFO: listening on port:{}", PORT);
-    let caches = Arc::new(RwLock::new(HashMap::new()));
+    info!("INFO: listening on port:{}", PORT);
+    let messages = Arc::new(RwLock::new(HashMap::new()));
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                let caches_clone = Arc::clone(&caches);
+                let messages_clone = Arc::clone(&messages);
                 tokio::spawn(async move {
-                    handle_incoming_connection(Arc::new(stream), caches_clone).await;
+                    handle_incoming_connection(Arc::new(stream), messages_clone).await;
                 });
             }
             Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
+                error!("Error accepting connection: {}", e);
             }
         }
     }
@@ -30,24 +35,38 @@ async fn main() -> Result<(), io::Error> {
 
 async fn handle_incoming_connection(
     stream: Arc<TcpStream>,
-    caches: Arc<RwLock<HashMap<String, HashSet<Vec<u8>>>>>,
+    messages: Arc<RwLock<HashMap<String, CommitLog>>>,
 ) {
-    let mut buffer = [0; BUFFER];
-    match stream.try_read(&mut buffer) {
-        Ok(0) => {
-            println!("INFO: Connection closed by the client");
-        }
-        Ok(bytes_read) => {
-            let mut server = Server::new(stream.clone(), caches.clone());
-            server.decode_buffer(buffer[..bytes_read].to_vec());
-        }
-        Err(err) => match err.kind() {
-            ErrorKind::WouldBlock => {
-                eprintln!("ERROR: Got an unexpected error: {:?}", err);
+    loop {
+        let mut buffer = [0; BUFFER];
+        match stream.try_read(&mut buffer) {
+            Ok(bytes_read) => {
+                if bytes_read < 1 {
+                    break;
+                } else {
+                    let mut server = Server::new(stream.clone(), messages.clone());
+                    let length = buffer[7];
+                    let tcp_header = BinaryHeader::from_bytes(&buffer[..length as usize]);
+                    let mut f = File::create("logers.txt").unwrap();
+                    f.write_all(&buffer[..length as usize]).unwrap();
+                    server
+                        .decode_buffer(
+                            tcp_header.command,
+                            tcp_header.payload,
+                            tcp_header.queue_name,
+                        )
+                        .await;
+                }
             }
-            _ => {
-                eprintln!("ERROR: Got an unexpected error: {:?}", err);
-            }
-        },
-    };
+            Err(err) => match err.kind() {
+                ErrorKind::WouldBlock => {
+                    continue;
+                }
+                _ => {
+                    error!("ERROR: Got an unexpected error: {:?}", err);
+                    return;
+                }
+            },
+        };
+    }
 }

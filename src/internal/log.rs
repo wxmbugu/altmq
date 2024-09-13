@@ -1,17 +1,20 @@
 // TODO: crc implementation data consistency
 // TODO: Log Replication and Log Compaction
 #![allow(dead_code)]
-#![allow(clippy::needless_question_mark)]
+#![allow(
+    clippy::needless_question_mark,
+    clippy::seek_from_current,
+    clippy::unused_io_amount
+)]
 use crate::Result;
 use core::str;
 use memmap2::{MmapMut, MmapOptions, RemapOptions};
 use std::{
-    collections::HashMap,
+    borrow::BorrowMut,
     fmt::Debug,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    u32, u64, u8, usize,
 };
 
 #[derive(Debug)]
@@ -23,30 +26,24 @@ pub enum StorageError {
     InvalidSeek,
     LogIndexOutofBound,
 }
-const SEGMENT_SIZE: usize = 200 * 1024 * 1024; //TODO: should be a setting
+pub const SEGMENT_SIZE: usize = 1024 * 1024; //TODO: should be a setting
 const START_OFFSET: usize = 0;
 // represents the size of our entry/idx byte size
 const ENTRY_SIZE: usize = 8;
 const DIR_PATH: &str = "storage/queue/";
 
-pub struct Storage {
-    pub segments: HashMap<String, Vec<Segment>>,
-    segment_size: u64,
-    dir_path: PathBuf, //TODO: should be a setting
-}
-
 pub struct CommitLog {
-    name: String,
+    pub name: String,
     pub segments: Vec<Segment>,
     dir_path: PathBuf,
     segment_size: u64,
 }
 
 pub struct Segment {
-    log: Log,
+    pub log: Log,
     path: PathBuf,
     base_offset: u64,
-    current_offset: u64,
+    pub current_offset: u64,
     segment_size: u64,
     closed: bool,
 }
@@ -54,13 +51,14 @@ pub struct Segment {
 pub struct Log {
     writer: CursorWriter<File>,
     reader: CursorReader<File>,
-    index: Index,
+    pub index: Index,
 }
 #[derive(Debug)]
 pub struct Index {
     file: File,
     mmap: MmapMut,
     offset: usize,
+    pub roffset: usize,
     max_size: usize,
 }
 #[derive(Debug)]
@@ -136,11 +134,39 @@ impl<T: Read + Seek> Seek for CursorReader<T> {
         Ok(self.position)
     }
 }
+impl Iterator for CommitLog {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut segment_idx = 0;
+        while segment_idx < self.segments.len() {
+            let segment = self.segments[segment_idx].borrow_mut();
+            match segment.read_from_start() {
+                Ok(data) => {
+                    if segment.log.reader.position + data.len() as u64
+                        == segment.log.writer.position
+                    {
+                        segment_idx += 1;
+                        continue;
+                    }
+
+                    return Some(data);
+                }
+                Err(_) => {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+}
+
 impl CommitLog {
-    pub fn new(queue_name: &str, segment_size: u64, dir_path: String) -> Self {
+    pub fn new(queue_name: &str, segment_size: u64, dir_path: &str) -> Self {
+        let dir_path = format!("{}{}", dir_path, queue_name);
         let mut segments: Vec<Segment> = Vec::new();
-        let segment = Segment::new(&dir_path, 0, segment_size);
         fs::create_dir_all(&dir_path).unwrap();
+        let segment = Segment::new(&dir_path, 0, segment_size);
         segments.push(segment);
 
         CommitLog {
@@ -182,23 +208,32 @@ impl CommitLog {
             self.segment_size,
         )
     }
+
     /// Restore data from disk by loading all segments from the directory
-    pub fn restore_from_disk(&mut self) -> Result<(), StorageError> {
-        if self.dir_path.read_dir()?.next().is_none() {
+    pub fn restore_from_disk(segment_size: u64, dir_path: &str) -> Result<Self, StorageError> {
+        let path = PathBuf::from(&dir_path);
+        let mut vec_segments = Vec::new();
+        let mut queue_name = String::new();
+        if path.read_dir()?.next().is_none() {
             Err(StorageError::DirEmpty)
         } else {
-            for entry in fs::read_dir(&self.dir_path).unwrap() {
+            for entry in fs::read_dir(&path).unwrap() {
                 let entry = entry.expect("dir entry");
                 let path = entry.path();
                 if path.is_dir() {
-                    let _sub_dir = path.strip_prefix(DIR_PATH).unwrap();
-                    let vec_segments = load_segments_from_disk(
-                        self.dir_path.to_str().expect("storage path").to_string(),
-                    );
-                    self.segments.extend(vec_segments);
+                    let sub_dir = path.strip_prefix(dir_path).unwrap();
+                    let segments =
+                        load_segments_from_disk(path.to_str().expect("storage path").to_string());
+                    vec_segments.extend(segments);
+                    queue_name = sub_dir.to_owned().to_str().unwrap().to_string();
                 }
             }
-            Ok(())
+            Ok(CommitLog {
+                name: queue_name.to_string(),
+                segments: vec_segments,
+                segment_size,
+                dir_path: path,
+            })
         }
     }
     ///reads the  message  where the cursor position is
@@ -212,6 +247,11 @@ impl CommitLog {
         let len_segments = self.segments.len();
         let segment = &mut self.segments[len_segments - 1];
         Ok(segment.read_previous()?)
+    }
+    pub fn read_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
+        let len_segments = self.segments.len();
+        let segment = &mut self.segments[len_segments - 1];
+        Ok(segment.read_from_start()?)
     }
     /// reads data stored from a given offset
     pub fn read_at_from_disk(&mut self, position: usize) -> Result<Vec<u8>, StorageError> {
@@ -326,8 +366,8 @@ impl Segment {
             Ok(_) => {
                 let entry = Entry::new(self.current_offset as u32, data.len() as u32);
                 self.log.write(data, &entry)?;
-                self.flush()?;
                 self.current_offset();
+                self.flush()?;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -338,7 +378,7 @@ impl Segment {
         Ok(())
     }
     fn current_offset(&mut self) {
-        self.current_offset = self.log.writer.position
+        self.current_offset = self.log.writer.position;
     }
     fn check_split(&self, entry_size: u64) -> Result<bool, StorageError> {
         match (self.current_offset + entry_size) > self.segment_size {
@@ -357,11 +397,18 @@ impl Segment {
         Ok(data)
     }
 
-    /// reads the message at the current index position
+    /// reads the message at the current writer index position
     fn read(&mut self) -> Result<Vec<u8>, StorageError> {
         let data = self.log.seek_current()?;
         Ok(data)
     }
+
+    /// reads the message at the current index position
+    fn read_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
+        let data = self.log.seek_from_start()?;
+        Ok(data)
+    }
+
     /// read previous message from the current index position
     fn read_previous(&mut self) -> Result<Vec<u8>, StorageError> {
         let data = self.log.seek_previous()?;
@@ -405,6 +452,7 @@ impl Index {
             file: idx_file,
             mmap,
             offset: 0,
+            roffset: 0,
             max_size,
         }
     }
@@ -425,6 +473,7 @@ impl Index {
             file: idx_file,
             mmap,
             offset: offset as usize,
+            roffset: 0,
             max_size,
         }
     }
@@ -449,20 +498,28 @@ impl Index {
         Entry::from_bytes(&self.mmap[self.offset - ENTRY_SIZE * 2..self.offset - ENTRY_SIZE])
     }
     // seek the entry data at a specific offset
-    fn seek_at(&self, offset: usize) -> Result<Entry, StorageError> {
+    fn seek_at(&mut self, offset: usize) -> Result<Entry, StorageError> {
         if offset.overflowing_sub(ENTRY_SIZE).1 || offset > self.offset {
             return Err(StorageError::LogIndexOutofBound);
         }
-        Ok(Entry::from_bytes(&self.mmap[offset - ENTRY_SIZE..(offset)]))
+        Ok(Entry::from_bytes(&self.mmap[offset..offset + ENTRY_SIZE]))
+    }
+
+    // seek the entry data at a specific offset
+    fn seek_from_start(&mut self) -> Result<Entry, StorageError> {
+        if self.roffset >= self.offset {
+            return Err(StorageError::LogIndexOutofBound);
+        }
+        self.roffset += 8;
+        Ok(Entry::from_bytes(
+            &self.mmap[self.roffset..(self.roffset + ENTRY_SIZE)],
+        ))
     }
     // seek next entry data after a specific offseet
     fn seek_after(&self, offset: usize) -> Result<Entry, StorageError> {
-        if offset.overflowing_sub(ENTRY_SIZE).1 || offset > self.offset {
-            return Err(StorageError::LogIndexOutofBound);
-        }
         Ok(Entry::from_bytes(&self.mmap[offset..(offset + ENTRY_SIZE)]))
     }
-    // seek the entry data at the current cursor position / offset
+    // seek the entry data at the current writer cursor position / offset
     fn seek_current(&self) -> Entry {
         Entry::from_bytes(&self.mmap[self.offset - ENTRY_SIZE..(self.offset)])
     }
@@ -485,25 +542,28 @@ impl Log {
             .truncate(true)
             .open(&path)
         {
-            Ok(file) => Ok(Log {
-                writer: CursorWriter::new(file.try_clone()?)?,
-                reader: CursorReader::new(file)?,
-                index: Index::new(dir, pos, SEGMENT_SIZE), //TODO Index: max_size should be a setting
-            }),
+            Ok(file) => {
+                let read_file = OpenOptions::new().read(true).open(&path)?;
+                Ok(Log {
+                    writer: CursorWriter::new(file)?,
+                    reader: CursorReader::new(read_file)?,
+                    index: Index::new(dir, pos, SEGMENT_SIZE), //TODO Index: max_size should be a setting
+                })
+            }
             Err(err) => Err(StorageError::IoError(err)),
         }
     }
     fn load(dir: &PathBuf, pos: u32, offset: u64, index_len: u64) -> Result<Log, StorageError> {
-        match OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open(dir.join(format!("{pos:0>12}.log")))
-        {
-            Ok(file) => Ok(Log {
-                writer: CursorWriter::new(file.try_clone()?)?,
-                reader: CursorReader::new(file)?,
-                index: Index::load(dir.to_owned(), pos, offset, index_len as usize),
-            }),
+        let path = dir.join(format!("{pos:0>12}.log"));
+        match OpenOptions::new().write(true).read(true).open(&path) {
+            Ok(file) => {
+                let read_file = OpenOptions::new().read(true).open(&path)?;
+                Ok(Log {
+                    writer: CursorWriter::new(file)?,
+                    reader: CursorReader::new(read_file)?,
+                    index: Index::load(dir.to_owned(), pos, offset, index_len as usize),
+                })
+            }
             Err(err) => Err(StorageError::IoError(err)),
         }
     }
@@ -526,6 +586,12 @@ impl Log {
     }
     fn seek_current(&mut self) -> Result<Vec<u8>, StorageError> {
         let entry = self.index.seek_current();
+        let mut buf = vec![0u8; entry.size as usize];
+        self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
+        Ok(buf.to_vec())
+    }
+    fn seek_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
+        let entry = self.index.seek_from_start()?;
         let mut buf = vec![0u8; entry.size as usize];
         self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
         Ok(buf.to_vec())
@@ -553,15 +619,13 @@ impl Log {
 mod test {
     #![allow(unused_imports)]
 
-    use crate::internal::log::{
-        load_segments_from_disk, CursorReader, Entry, Storage, SEGMENT_SIZE,
-    };
-    use crate::internal::queue;
+    use crate::internal::log::{load_segments_from_disk, CursorReader, Entry, SEGMENT_SIZE};
 
     use super::{Segment, StorageError};
     use std::cell::RefCell;
     use std::io::Read;
     use std::ops::Div;
+    use std::panic;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Once;
@@ -571,7 +635,6 @@ mod test {
         os::{self},
     };
     use std::{fs::File, path};
-    use std::{panic, u64};
     const PATH: &str = "test_data";
     use std::{sync::Mutex, thread::sleep};
     #[test]
@@ -586,7 +649,7 @@ mod test {
         assert_eq!(seg.current_offset, data.len() as u64)
     }
 
-    // #[test]
+    #[test]
     #[should_panic]
     fn test_no_space_left() {
         let segment_size = 12;
@@ -640,8 +703,7 @@ mod test {
         assert_eq!(read_data, data);
         assert_eq!(read_current_data, data2);
     }
-
-    // #[test]
+    #[test]
     #[should_panic]
     fn test_log_read_at_panic() {
         let offset = SystemTime::now()

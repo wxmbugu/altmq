@@ -508,12 +508,13 @@ impl Index {
     // seek the entry data at a specific offset
     fn seek_from_start(&mut self) -> Result<Entry, StorageError> {
         if self.roffset >= self.offset {
-            return Err(StorageError::LogIndexOutofBound);
+            Err(StorageError::LogIndexOutofBound)
+        } else {
+            self.roffset += 8;
+            Ok(Entry::from_bytes(
+                &self.mmap[self.roffset..(self.roffset + ENTRY_SIZE)],
+            ))
         }
-        self.roffset += 8;
-        Ok(Entry::from_bytes(
-            &self.mmap[self.roffset..(self.roffset + ENTRY_SIZE)],
-        ))
     }
     // seek next entry data after a specific offseet
     fn seek_after(&self, offset: usize) -> Result<Entry, StorageError> {

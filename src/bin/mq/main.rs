@@ -1,8 +1,7 @@
 use mq::internal::log::CommitLog;
 use mq::{BinaryHeader, Result, Server};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -47,8 +46,6 @@ async fn handle_incoming_connection(
                     let mut server = Server::new(stream.clone(), messages.clone());
                     let length = buffer[7];
                     let tcp_header = BinaryHeader::from_bytes(&buffer[..length as usize]);
-                    let mut f = File::create("logers.txt").unwrap();
-                    f.write_all(&buffer[..length as usize]).unwrap();
                     server
                         .decode_buffer(
                             tcp_header.command,

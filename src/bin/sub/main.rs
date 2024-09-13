@@ -13,5 +13,4 @@ async fn main() -> Result<(), io::Error> {
     loop {
         queue.subscribe("adventure").await?;
     }
-    // Ok(())
 }

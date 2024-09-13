@@ -178,7 +178,7 @@ impl MessageQueueClient {
         let topic = Topic::new(1, 1718709072, message.to_vec());
         let payload = BinaryHeader::new(2, Some(queue_name.to_string()), Some(topic.to_bytes()));
         self.send_message(payload.to_bytes()).await?;
-        sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(1)).await;
         Ok(())
     }
 

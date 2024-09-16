@@ -1,5 +1,5 @@
-#![allow(clippy::await_holding_lock)]
 use internal::log::{CommitLog, SEGMENT_SIZE};
+use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, PoisonError};
@@ -7,8 +7,6 @@ use std::{io, result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
-use tokio::time::Duration;
 use tracing::{error, info};
 
 pub mod internal;
@@ -48,8 +46,20 @@ impl From<io::Error> for ServerError {
 
 async fn send_response_ok(
     stream: &mut Arc<TcpStream>,
-    resp: Response,
+    resp_message: ResponseMessage,
+    data: Option<Vec<u8>>,
 ) -> Result<usize, ServerError> {
+    let resp = Response::new(ResponseCode::Ok, resp_message, data);
+    let usize = stream.try_write(&resp.to_bytes())?;
+    Ok(usize)
+}
+
+async fn send_response_err(
+    stream: &mut Arc<TcpStream>,
+    resp_message: ResponseMessage,
+    data: Option<Vec<u8>>,
+) -> Result<usize, ServerError> {
+    let resp = Response::new(ResponseCode::Err, resp_message, data);
     let usize = stream.try_write(&resp.to_bytes())?;
     Ok(usize)
 }
@@ -76,8 +86,9 @@ impl Server {
         queue_name: Option<String>,
     ) {
         if queue_name.is_none() {
-            let resp = Response::new(ResponseCode::Err, ResponseMessage::QueueNameRequired, None);
-            if let Err(e) = send_response_ok(&mut self.stream, resp).await {
+            if let Err(e) =
+                send_response_err(&mut self.stream, ResponseMessage::QueueNameRequired, None).await
+            {
                 error!("ERROR: Failed to write response to stream: {:?}", e);
                 return;
             }
@@ -88,7 +99,7 @@ impl Server {
                 let name = queue_name.unwrap();
                 let mut message_map = self.messages.write().await;
                 if let Some(commit_log) = message_map.get_mut(&name) {
-                    let data = match commit_log.read_from_start() {
+                    let data = match commit_log.read() {
                         Ok(data) => Some(data),
                         Err(_) => None,
                     };
@@ -96,9 +107,7 @@ impl Server {
                     if data.is_none() || data.clone().unwrap().is_empty() {
                         message = ResponseMessage::NoNewMessages;
                     }
-
-                    let resp = Response::new(ResponseCode::Ok, message, data);
-                    if let Err(e) = send_response_ok(&mut self.stream, resp).await {
+                    if let Err(e) = send_response_ok(&mut self.stream, message, data).await {
                         error!("ERROR: Failed to write response to stream: {:?}", e);
                         return;
                     }
@@ -109,12 +118,13 @@ impl Server {
             }
             Commands::PUBLISH => {
                 if data.is_none() {
-                    let resp = Response::new(
-                        ResponseCode::Err,
+                    if let Err(e) = send_response_err(
+                        &mut self.stream,
                         ResponseMessage::MessageBodyRequired,
                         None,
-                    );
-                    if let Err(e) = send_response_ok(&mut self.stream, resp).await {
+                    )
+                    .await
+                    {
                         error!("ERROR: Failed to write response to stream: {:?}", e);
                         return;
                     }
@@ -133,8 +143,9 @@ impl Server {
                         };
                     }
                 }
-                let resp = Response::new(ResponseCode::Ok, ResponseMessage::EmptyResponse, None);
-                if let Err(e) = send_response_ok(&mut self.stream, resp).await {
+                if let Err(e) =
+                    send_response_ok(&mut self.stream, ResponseMessage::EmptyResponse, None).await
+                {
                     error!("ERROR: Failed to write response to stream: {:?}", e);
                 }
             }
@@ -162,6 +173,14 @@ impl Server {
             .insert(queue_name.to_owned(), log);
         Ok(())
     }
+    pub async fn restore_from_disk(mut messages: Arc<RwLock<HashMap<String, CommitLog>>>) {
+        let logs = CommitLog::restore_from_disk(SEGMENT_SIZE as u64, DIR_PATH).unwrap();
+        for log in logs {
+            let mut messages = messages.borrow_mut().write().await;
+            info!("loading topic  name:{}, path:{:?}", &log.name, log.dir_path);
+            messages.insert(log.name.to_owned(), log);
+        }
+    }
 }
 
 pub struct MessageQueueClient {
@@ -178,7 +197,6 @@ impl MessageQueueClient {
         let topic = Topic::new(1, 1718709072, message.to_vec());
         let payload = BinaryHeader::new(2, Some(queue_name.to_string()), Some(topic.to_bytes()));
         self.send_message(payload.to_bytes()).await?;
-        sleep(Duration::from_millis(1)).await;
         Ok(())
     }
 

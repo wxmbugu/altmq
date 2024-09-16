@@ -14,6 +14,7 @@ use std::{
     fmt::Debug,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::PathBuf,
 };
 
@@ -35,8 +36,12 @@ const DIR_PATH: &str = "storage/queue/";
 pub struct CommitLog {
     pub name: String,
     pub segments: Vec<Segment>,
-    dir_path: PathBuf,
+    pub dir_path: PathBuf,
     segment_size: u64,
+    // track where the last read from the client to queue was from
+    pub queue_pos: File,
+    pub position: u32,
+    rindex_offset: u32,
 }
 
 pub struct Segment {
@@ -53,6 +58,7 @@ pub struct Log {
     reader: CursorReader<File>,
     pub index: Index,
 }
+
 #[derive(Debug)]
 pub struct Index {
     file: File,
@@ -61,6 +67,31 @@ pub struct Index {
     pub roffset: usize,
     max_size: usize,
 }
+
+//will be used to track the position of commit log and save to disk
+#[derive(Debug)]
+pub struct Tracker {
+    // which file it was reading at before closing
+    position: u32,
+    //offset in specific file
+    offset: u32,
+}
+
+impl Tracker {
+    pub fn to_bytes(position: u32, offset: u32) -> Vec<u8> {
+        let mut payload: Vec<u8> =
+            Vec::with_capacity(offset.to_be_bytes().len() + position.to_be_bytes().len());
+        payload.extend(position.to_be_bytes());
+        payload.extend(offset.to_be_bytes());
+        payload
+    }
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let position = u32::from_be_bytes(buf[..4].try_into().unwrap());
+        let offset = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+        Self { position, offset }
+    }
+}
+
 #[derive(Debug)]
 pub struct Entry {
     offset: u32,
@@ -165,15 +196,24 @@ impl CommitLog {
     pub fn new(queue_name: &str, segment_size: u64, dir_path: &str) -> Self {
         let dir_path = format!("{}{}", dir_path, queue_name);
         let mut segments: Vec<Segment> = Vec::new();
-        fs::create_dir_all(&dir_path).unwrap();
+        let offsets_path = format!("{}/{}", dir_path, "offsets");
+        fs::create_dir_all(&offsets_path).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(format!("{offsets_path}/{}", queue_name))
+            .unwrap();
         let segment = Segment::new(&dir_path, 0, segment_size);
         segments.push(segment);
-
         CommitLog {
             name: queue_name.to_owned(),
             segments,
             segment_size,
             dir_path: PathBuf::from(dir_path),
+            queue_pos: file,
+            position: 0,
+            rindex_offset: 0,
         }
     }
     /// Save data to disk by appending to the current segment
@@ -210,16 +250,19 @@ impl CommitLog {
     }
 
     /// Restore data from disk by loading all segments from the directory
-    pub fn restore_from_disk(segment_size: u64, dir_path: &str) -> Result<Self, StorageError> {
+    pub fn restore_from_disk(segment_size: u64, dir_path: &str) -> Result<Vec<Self>, StorageError> {
         let path = PathBuf::from(&dir_path);
-        let mut vec_segments = Vec::new();
         let mut queue_name = String::new();
+        let mut logs = Vec::new();
+
         if path.read_dir()?.next().is_none() {
             Err(StorageError::DirEmpty)
         } else {
             for entry in fs::read_dir(&path).unwrap() {
+                let mut vec_segments = Vec::new();
                 let entry = entry.expect("dir entry");
                 let path = entry.path();
+
                 if path.is_dir() {
                     let sub_dir = path.strip_prefix(dir_path).unwrap();
                     let segments =
@@ -227,31 +270,40 @@ impl CommitLog {
                     vec_segments.extend(segments);
                     queue_name = sub_dir.to_owned().to_str().unwrap().to_string();
                 }
+                let offsets_path = format!("{}/{queue_name}/{}", dir_path, "offsets");
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(format!("{offsets_path}/{}", queue_name))
+                    .unwrap();
+                let mut buf = [0; 8];
+                file.read(&mut buf).unwrap();
+                let tracker = Tracker::from_bytes(&buf);
+                let log = CommitLog {
+                    name: queue_name.to_string(),
+                    segments: vec_segments,
+                    segment_size,
+                    dir_path: path,
+                    position: tracker.position,
+                    queue_pos: file,
+                    rindex_offset: tracker.offset + ENTRY_SIZE as u32,
+                };
+                logs.push(log);
             }
-            Ok(CommitLog {
-                name: queue_name.to_string(),
-                segments: vec_segments,
-                segment_size,
-                dir_path: path,
-            })
+            Ok(logs)
         }
     }
-    ///reads the  message  where the cursor position is
-    pub fn read_from_disk(&mut self) -> Result<Vec<u8>, StorageError> {
-        let len_segments = self.segments.len();
-        let segment = &mut self.segments[len_segments - 1];
-        Ok(segment.read()?)
-    }
-    ///reads the previous message from where the cursor is  
-    pub fn read_previous_from_disk(&mut self) -> Result<Vec<u8>, StorageError> {
-        let len_segments = self.segments.len();
-        let segment = &mut self.segments[len_segments - 1];
-        Ok(segment.read_previous()?)
-    }
-    pub fn read_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
-        let len_segments = self.segments.len();
-        let segment = &mut self.segments[len_segments - 1];
-        Ok(segment.read_from_start()?)
+
+    pub fn read(&mut self) -> Result<Vec<u8>, StorageError> {
+        let segment = &mut self.segments[self.position as usize];
+        let payload = Tracker::to_bytes(self.position, self.rindex_offset);
+        if self.rindex_offset as usize == segment.log.index.offset {
+            // go the next segment in the vec of segments
+            self.position += 1;
+        }
+        self.queue_pos.write_at(&payload, 0).unwrap();
+        self.rindex_offset += ENTRY_SIZE as u32;
+        Ok(segment.read_at(self.rindex_offset as usize)?)
     }
     /// reads data stored from a given offset
     pub fn read_at_from_disk(&mut self, position: usize) -> Result<Vec<u8>, StorageError> {
@@ -260,6 +312,12 @@ impl CommitLog {
         Ok(segment.read_at(position)?)
     }
 
+    /// reads data stored from a given offset
+    pub fn read_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
+        let len_segments = self.segments.len();
+        let segment = &mut self.segments[len_segments - 1];
+        Ok(segment.read_from_start()?)
+    }
     /// reads next data stored from a given offset
     pub fn read_next_from_disk(&mut self, position: usize) -> Result<Vec<u8>, StorageError> {
         let len_segments = self.segments.len();
@@ -396,22 +454,9 @@ impl Segment {
         let data = self.log.seek_next(position)?;
         Ok(data)
     }
-
-    /// reads the message at the current writer index position
-    fn read(&mut self) -> Result<Vec<u8>, StorageError> {
-        let data = self.log.seek_current()?;
-        Ok(data)
-    }
-
-    /// reads the message at the current index position
+    /// reads the message at the current read offset position
     fn read_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
         let data = self.log.seek_from_start()?;
-        Ok(data)
-    }
-
-    /// read previous message from the current index position
-    fn read_previous(&mut self) -> Result<Vec<u8>, StorageError> {
-        let data = self.log.seek_previous()?;
         Ok(data)
     }
 
@@ -489,20 +534,13 @@ impl Index {
         self.mmap.flush()?;
         Ok(())
     }
-    // seek the entry data before the current cursor or offset
-    fn seek_before_offset(&self) -> Entry {
-        // to jump to the previous entry position we have to skip twice the size to return to  the previous offset
-        // if we jump by only the size of the entry which is 8 we will be at the start of the current offset and not at the previous offset
-        // to get to the end of the previous offset we will have now to minus the size which is the end and also means its the end
-        // of the previous offset
-        Entry::from_bytes(&self.mmap[self.offset - ENTRY_SIZE * 2..self.offset - ENTRY_SIZE])
-    }
+
     // seek the entry data at a specific offset
     fn seek_at(&mut self, offset: usize) -> Result<Entry, StorageError> {
         if offset.overflowing_sub(ENTRY_SIZE).1 || offset > self.offset {
             return Err(StorageError::LogIndexOutofBound);
         }
-        Ok(Entry::from_bytes(&self.mmap[offset..offset + ENTRY_SIZE]))
+        Ok(Entry::from_bytes(&self.mmap[offset - ENTRY_SIZE..offset]))
     }
 
     // seek the entry data at a specific offset
@@ -512,7 +550,7 @@ impl Index {
         } else {
             self.roffset += 8;
             Ok(Entry::from_bytes(
-                &self.mmap[self.roffset..(self.roffset + ENTRY_SIZE)],
+                &self.mmap[(self.roffset - ENTRY_SIZE)..self.roffset],
             ))
         }
     }
@@ -536,6 +574,8 @@ impl Index {
 impl Log {
     fn new(dir: &PathBuf, pos: u32) -> Result<Log, StorageError> {
         let path = dir.join(format!("{pos:0>12}.log"));
+        let offsets_path = format!("{}/{}", dir.as_path().to_str().unwrap(), "offsets");
+        fs::create_dir_all(offsets_path).unwrap();
         match OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -585,12 +625,7 @@ impl Log {
         self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
         Ok(buf[..entry.size as usize].to_vec())
     }
-    fn seek_current(&mut self) -> Result<Vec<u8>, StorageError> {
-        let entry = self.index.seek_current();
-        let mut buf = vec![0u8; entry.size as usize];
-        self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
-        Ok(buf.to_vec())
-    }
+
     fn seek_from_start(&mut self) -> Result<Vec<u8>, StorageError> {
         let entry = self.index.seek_from_start()?;
         let mut buf = vec![0u8; entry.size as usize];
@@ -603,13 +638,7 @@ impl Log {
         self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
         Ok(buf.to_vec())
     }
-    //seek previous message from the current offset
-    fn seek_previous(&mut self) -> Result<Vec<u8>, StorageError> {
-        let entry = self.index.seek_before_offset();
-        let mut buf = vec![0u8; entry.size as usize];
-        self.reader.read_at(&mut buf[..], (entry.offset) as u64)?;
-        Ok(buf.to_vec())
-    }
+
     // TODO: Test This when too man files are created and not closed
     // fn close(&self) {
     //     drop(self.file)
@@ -699,8 +728,8 @@ mod test {
         let data2 = b"Hello World!1";
         seg.append_data(data).unwrap();
         seg.append_data(data2).unwrap();
-        let read_data = seg.read_previous().unwrap();
-        let read_current_data = seg.read().unwrap();
+        let read_data = seg.read_at(8).unwrap();
+        let read_current_data = seg.read_at(16).unwrap();
         assert_eq!(read_data, data);
         assert_eq!(read_current_data, data2);
     }

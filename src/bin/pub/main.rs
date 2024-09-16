@@ -2,6 +2,8 @@
 use mq::MessageQueueClient;
 use mq::Result;
 use std::io;
+use tokio::time::sleep;
+use tokio::time::Duration;
 
 static ADDR: &str = "127.0.0.1:9000";
 
@@ -14,11 +16,13 @@ async fn main() -> Result<(), io::Error> {
     let mut queue = MessageQueueClient::dial(ADDR).await?;
     loop {
         queue
-            .publish("adventure", format!("Hello World-{id}").as_bytes())
+            .publish("new", format!("Hello World-{id}").as_bytes())
             .await
             .unwrap();
 
         id += 1;
+        sleep(Duration::from_millis(100)).await;
+
         // if id == 10 {
         // break;
         // }

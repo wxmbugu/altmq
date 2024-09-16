@@ -1,6 +1,7 @@
-use internal::log::{CommitLog, SEGMENT_SIZE};
+use internal::log::{CommitLog, StorageError, SEGMENT_SIZE};
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::sync::{Arc, PoisonError};
 use std::{io, result};
@@ -174,11 +175,21 @@ impl Server {
         Ok(())
     }
     pub async fn restore_from_disk(mut messages: Arc<RwLock<HashMap<String, CommitLog>>>) {
-        let logs = CommitLog::restore_from_disk(SEGMENT_SIZE as u64, DIR_PATH).unwrap();
-        for log in logs {
-            let mut messages = messages.borrow_mut().write().await;
-            info!("loading topic  name:{}, path:{:?}", &log.name, log.dir_path);
-            messages.insert(log.name.to_owned(), log);
+        match CommitLog::restore_from_disk(SEGMENT_SIZE as u64, DIR_PATH) {
+            Ok(logs) => {
+                for log in logs {
+                    let mut messages = messages.borrow_mut().write().await;
+                    info!("loading topic  name:{}, path:{:?}", &log.name, log.dir_path);
+                    messages.insert(log.name.to_owned(), log);
+                }
+            }
+            Err(e) => {
+                if e.to_string() == StorageError::IoError(io::Error::last_os_error()).to_string() {
+                    info!("No topic created: {e:?}");
+                } else {
+                    error!("an error occured:{e}")
+                }
+            }
         }
     }
 }
@@ -197,6 +208,7 @@ impl MessageQueueClient {
         let topic = Topic::new(1, 1718709072, message.to_vec());
         let payload = BinaryHeader::new(2, Some(queue_name.to_string()), Some(topic.to_bytes()));
         self.send_message(payload.to_bytes()).await?;
+        info!("Payload sent: {payload:?}");
         Ok(())
     }
 

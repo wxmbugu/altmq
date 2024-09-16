@@ -11,7 +11,7 @@ use core::str;
 use memmap2::{MmapMut, MmapOptions, RemapOptions};
 use std::{
     borrow::BorrowMut,
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
@@ -26,6 +26,12 @@ pub enum StorageError {
     DirEmpty,
     InvalidSeek,
     LogIndexOutofBound,
+}
+
+impl Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", format!("{:?}", self).to_lowercase())
+    }
 }
 pub const SEGMENT_SIZE: usize = 1024 * 1024; //TODO: should be a setting
 const START_OFFSET: usize = 0;
@@ -75,20 +81,31 @@ pub struct Tracker {
     position: u32,
     //offset in specific file
     offset: u32,
+    last_write_offset: u32,
 }
 
 impl Tracker {
-    pub fn to_bytes(position: u32, offset: u32) -> Vec<u8> {
-        let mut payload: Vec<u8> =
-            Vec::with_capacity(offset.to_be_bytes().len() + position.to_be_bytes().len());
+    pub fn to_bytes(position: u32, offset: u32, lwoffset: u32) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::with_capacity(
+            offset.to_be_bytes().len()
+                + position.to_be_bytes().len()
+                + lwoffset.to_be_bytes().len(),
+        );
         payload.extend(position.to_be_bytes());
         payload.extend(offset.to_be_bytes());
+        payload.extend(lwoffset.to_be_bytes());
         payload
     }
     pub fn from_bytes(buf: &[u8]) -> Self {
         let position = u32::from_be_bytes(buf[..4].try_into().unwrap());
         let offset = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-        Self { position, offset }
+        let lwoffset = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+
+        Self {
+            position,
+            offset,
+            last_write_offset: lwoffset,
+        }
     }
 }
 
@@ -223,9 +240,14 @@ impl CommitLog {
     /// Append data to the current segment, or create a new segment if necessary
     fn save_data_to_segment(&mut self, data: &[u8]) -> Result<(), StorageError> {
         let len_segments = self.segments.len();
+        let mut segment_offset = self.segments[self.position as usize].log.index.offset as u32;
+
         let segment = &mut self.segments[len_segments - 1];
         match segment.append_data(data) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.save_queue_offset(segment_offset);
+                Ok(())
+            }
             Err(e) => match e {
                 StorageError::NoSpaceLeft => {
                     segment.log.index.resize();
@@ -233,7 +255,9 @@ impl CommitLog {
                     // Handle segment full scenario by closing the current segment and creating a new one
                     let mut new_segment = self.create_new_segment(len_segments as u32);
                     new_segment.append_data(data)?;
+                    segment_offset = new_segment.log.index.offset as u32;
                     self.segments.push(new_segment);
+                    self.save_queue_offset(segment_offset.to_owned());
                     Ok(())
                 }
                 _ => Err(e),
@@ -252,9 +276,8 @@ impl CommitLog {
     /// Restore data from disk by loading all segments from the directory
     pub fn restore_from_disk(segment_size: u64, dir_path: &str) -> Result<Vec<Self>, StorageError> {
         let path = PathBuf::from(&dir_path);
-        let mut queue_name = String::new();
+        let mut _queue_name = String::new();
         let mut logs = Vec::new();
-
         if path.read_dir()?.next().is_none() {
             Err(StorageError::DirEmpty)
         } else {
@@ -262,48 +285,65 @@ impl CommitLog {
                 let mut vec_segments = Vec::new();
                 let entry = entry.expect("dir entry");
                 let path = entry.path();
-
                 if path.is_dir() {
                     let sub_dir = path.strip_prefix(dir_path).unwrap();
-                    let segments =
-                        load_segments_from_disk(path.to_str().expect("storage path").to_string());
+                    _queue_name = sub_dir.to_owned().to_str().unwrap().to_string();
+                    let offsets_path = format!("{}{_queue_name}/{}", dir_path, "offsets");
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .open(format!("{offsets_path}/{}", _queue_name))
+                        .unwrap();
+                    let mut buf = [0; 12];
+                    file.read(&mut buf).unwrap();
+                    let tracker = Tracker::from_bytes(&buf);
+
+                    let segments = load_segments_from_disk(
+                        path.to_str().expect("storage path").to_string(),
+                        tracker.last_write_offset as usize,
+                    );
                     vec_segments.extend(segments);
-                    queue_name = sub_dir.to_owned().to_str().unwrap().to_string();
+                    let log = CommitLog {
+                        name: _queue_name.to_string(),
+                        segments: vec_segments,
+                        segment_size,
+                        dir_path: path,
+                        position: tracker.position,
+                        queue_pos: file,
+                        rindex_offset: tracker.offset,
+                    };
+                    logs.push(log);
                 }
-                let offsets_path = format!("{}/{queue_name}/{}", dir_path, "offsets");
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(format!("{offsets_path}/{}", queue_name))
-                    .unwrap();
-                let mut buf = [0; 8];
-                file.read(&mut buf).unwrap();
-                let tracker = Tracker::from_bytes(&buf);
-                let log = CommitLog {
-                    name: queue_name.to_string(),
-                    segments: vec_segments,
-                    segment_size,
-                    dir_path: path,
-                    position: tracker.position,
-                    queue_pos: file,
-                    rindex_offset: tracker.offset + ENTRY_SIZE as u32,
-                };
-                logs.push(log);
             }
             Ok(logs)
         }
     }
 
     pub fn read(&mut self) -> Result<Vec<u8>, StorageError> {
-        let segment = &mut self.segments[self.position as usize];
-        let payload = Tracker::to_bytes(self.position, self.rindex_offset);
-        if self.rindex_offset as usize == segment.log.index.offset {
-            // go the next segment in the vec of segments
+        let len = self.segments.len() - 1;
+        let segment_offset = self.segments[self.position as usize].log.index.offset as u32;
+        if self.rindex_offset > segment_offset
+            && segment_offset == SEGMENT_SIZE as u32
+            && self.position == len as u32
+        {
             self.position += 1;
         }
-        self.queue_pos.write_at(&payload, 0).unwrap();
+        if self.rindex_offset >= segment_offset {
+            self.rindex_offset = segment_offset;
+            return Err(StorageError::LogIndexOutofBound);
+        }
         self.rindex_offset += ENTRY_SIZE as u32;
+
+        self.save_queue_offset(segment_offset);
+        let segment = &mut self.segments[self.position as usize];
+
         Ok(segment.read_at(self.rindex_offset as usize)?)
+    }
+    // saves the current read offset of queue and the write offset of the log
+    fn save_queue_offset(&mut self, index_offset: u32) {
+        let payload = Tracker::to_bytes(self.position, self.rindex_offset, index_offset);
+        self.queue_pos.write_at(&payload, 0).unwrap();
     }
     /// reads data stored from a given offset
     pub fn read_at_from_disk(&mut self, position: usize) -> Result<Vec<u8>, StorageError> {
@@ -327,7 +367,7 @@ impl CommitLog {
 }
 
 /// Reads the entire data stored on disk and loads it as a vector of segments
-pub fn load_segments_from_disk(path: String) -> Vec<Segment> {
+pub fn load_segments_from_disk(path: String, l_offset: usize) -> Vec<Segment> {
     let mut log_file: Vec<u32> = Vec::new();
     let mut segments: Vec<Segment> = Vec::new();
     for entry in fs::read_dir(&path).unwrap() {
@@ -353,11 +393,21 @@ pub fn load_segments_from_disk(path: String) -> Vec<Segment> {
         let idx_f = File::open(&idx_path).unwrap();
         let metadata = idx_f.metadata().unwrap();
         let mut segment_size = metadata.len();
+        let mut last_entry_offset = None;
+
         if log == last_log {
             segment_size = SEGMENT_SIZE as u64;
+            last_entry_offset = Some(l_offset as u32);
         }
-        let segment =
-            load_segment(&path, log_path, idx_path, log, segment_size).expect("a segment");
+        let segment = load_segment(
+            &path,
+            log_path,
+            idx_path,
+            log,
+            segment_size,
+            last_entry_offset,
+        )
+        .expect("a segment");
         segments.push(segment)
     }
     segments
@@ -369,18 +419,21 @@ fn load_segment(
     index_path: String,
     log_id: u32,
     index_len: u64,
+    mut last_entry_offset: Option<u32>,
 ) -> Result<Segment, StorageError> {
     let idx_f = File::open(index_path)?;
     let log_f = File::open(log_path)?;
     let log_md = log_f.metadata()?;
     let idx_md = idx_f.metadata()?;
-    let last_entry_offset = idx_md.len();
+    if last_entry_offset.is_none() {
+        last_entry_offset = Some(idx_md.len() as u32);
+    }
     let segment = Segment::load(
         dir_path,
         log_id,
         log_md.len(),
         SEGMENT_SIZE as u64,
-        last_entry_offset,
+        last_entry_offset.unwrap() as u64,
         false,
         index_len,
     );
@@ -504,7 +557,7 @@ impl Index {
     fn load(dir: PathBuf, pos: u32, offset: u64, max_size: usize) -> Index {
         let idx_file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .append(true)
             .open(dir.join(format!("{pos:0>12}.idx")))
             .unwrap();
         idx_file.set_len(max_size as u64).unwrap(); //TODO: fix this for setting log file len(maybe a calculate how long the index file should be)
@@ -540,7 +593,7 @@ impl Index {
         if offset.overflowing_sub(ENTRY_SIZE).1 || offset > self.offset {
             return Err(StorageError::LogIndexOutofBound);
         }
-        Ok(Entry::from_bytes(&self.mmap[offset - ENTRY_SIZE..offset]))
+        Ok(Entry::from_bytes(&self.mmap[(offset - ENTRY_SIZE)..offset]))
     }
 
     // seek the entry data at a specific offset
@@ -596,7 +649,7 @@ impl Log {
     }
     fn load(dir: &PathBuf, pos: u32, offset: u64, index_len: u64) -> Result<Log, StorageError> {
         let path = dir.join(format!("{pos:0>12}.log"));
-        match OpenOptions::new().write(true).read(true).open(&path) {
+        match OpenOptions::new().append(true).read(true).open(&path) {
             Ok(file) => {
                 let read_file = OpenOptions::new().read(true).open(&path)?;
                 Ok(Log {

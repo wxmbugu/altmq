@@ -14,7 +14,7 @@ async fn main() -> Result<(), io::Error> {
 
     let mut queue = MessageQueueClient::dial(ADDR).await?;
     loop {
-        queue.subscribe("test_random").await?;
+        queue.subscribe("new").await?;
         sleep(Duration::from_millis(200)).await;
     }
 }

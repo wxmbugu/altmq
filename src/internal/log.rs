@@ -46,8 +46,14 @@ pub struct CommitLog {
     segment_size: u64,
     // track where the last read from the client to queue was from
     pub queue_pos: File,
-    pub position: u32,
+    // keep track of the last segment to be read
+    rposition: u32,
+    // keep track of the offset that was  last read by client
     rindex_offset: u32,
+    // keep track of the last segment to be written
+    wposition: u32,
+    // keep track of the offset that was  last write by client
+    windex_offset: u32,
 }
 
 pub struct Segment {
@@ -229,8 +235,10 @@ impl CommitLog {
             segment_size,
             dir_path: PathBuf::from(dir_path),
             queue_pos: file,
-            position: 0,
+            rposition: 0,
             rindex_offset: 0,
+            windex_offset: 0,
+            wposition: 0,
         }
     }
     /// Save data to disk by appending to the current segment
@@ -240,12 +248,12 @@ impl CommitLog {
     /// Append data to the current segment, or create a new segment if necessary
     fn save_data_to_segment(&mut self, data: &[u8]) -> Result<(), StorageError> {
         let len_segments = self.segments.len();
-        let mut segment_offset = self.segments[self.position as usize].log.index.offset as u32;
 
+        self.windex_offset = self.segments[self.wposition as usize].log.index.offset as u32;
         let segment = &mut self.segments[len_segments - 1];
         match segment.append_data(data) {
             Ok(_) => {
-                self.save_queue_offset(segment_offset);
+                self.save_queue_offset();
                 Ok(())
             }
             Err(e) => match e {
@@ -255,9 +263,10 @@ impl CommitLog {
                     // Handle segment full scenario by closing the current segment and creating a new one
                     let mut new_segment = self.create_new_segment(len_segments as u32);
                     new_segment.append_data(data)?;
-                    segment_offset = new_segment.log.index.offset as u32;
+                    self.windex_offset = new_segment.log.index.offset as u32;
                     self.segments.push(new_segment);
-                    self.save_queue_offset(segment_offset.to_owned());
+                    self.wposition += 1;
+                    self.save_queue_offset();
                     Ok(())
                 }
                 _ => Err(e),
@@ -298,20 +307,22 @@ impl CommitLog {
                     let mut buf = [0; 12];
                     file.read(&mut buf).unwrap();
                     let tracker = Tracker::from_bytes(&buf);
-
                     let segments = load_segments_from_disk(
                         path.to_str().expect("storage path").to_string(),
                         tracker.last_write_offset as usize,
                     );
                     vec_segments.extend(segments);
+                    let total_segments = vec_segments.len();
                     let log = CommitLog {
                         name: _queue_name.to_string(),
                         segments: vec_segments,
                         segment_size,
                         dir_path: path,
-                        position: tracker.position,
+                        rposition: tracker.position,
                         queue_pos: file,
                         rindex_offset: tracker.offset,
+                        wposition: (total_segments - 1) as u32,
+                        windex_offset: tracker.last_write_offset,
                     };
                     logs.push(log);
                 }
@@ -322,27 +333,22 @@ impl CommitLog {
 
     pub fn read(&mut self) -> Result<Vec<u8>, StorageError> {
         let len = self.segments.len() - 1;
-        let segment_offset = self.segments[self.position as usize].log.index.offset as u32;
-        if self.rindex_offset > segment_offset
-            && segment_offset == SEGMENT_SIZE as u32
-            && self.position == len as u32
-        {
-            self.position += 1;
-        }
-        if self.rindex_offset >= segment_offset {
+        let segment_offset = self.segments[self.rposition as usize].log.index.offset as u32;
+        if self.rindex_offset >= segment_offset && self.rposition == len as u32 {
             self.rindex_offset = segment_offset;
             return Err(StorageError::LogIndexOutofBound);
         }
+        if self.rindex_offset >= segment_offset && self.rposition != len as u32 {
+            self.rposition += 1;
+            self.rindex_offset = 0;
+        }
         self.rindex_offset += ENTRY_SIZE as u32;
-
-        self.save_queue_offset(segment_offset);
-        let segment = &mut self.segments[self.position as usize];
-
+        self.save_queue_offset();
+        let segment = &mut self.segments[self.rposition as usize];
         Ok(segment.read_at(self.rindex_offset as usize)?)
     }
-    // saves the current read offset of queue and the write offset of the log
-    fn save_queue_offset(&mut self, index_offset: u32) {
-        let payload = Tracker::to_bytes(self.position, self.rindex_offset, index_offset);
+    fn save_queue_offset(&mut self) {
+        let payload = Tracker::to_bytes(self.rposition, self.rindex_offset, self.windex_offset);
         self.queue_pos.write_at(&payload, 0).unwrap();
     }
     /// reads data stored from a given offset

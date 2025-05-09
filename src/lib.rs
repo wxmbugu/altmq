@@ -100,10 +100,7 @@ impl Server {
                 let name = queue_name.unwrap();
                 let mut message_map = self.messages.write().await;
                 if let Some(commit_log) = message_map.get_mut(&name) {
-                    let data = match commit_log.read() {
-                        Ok(data) => Some(data),
-                        Err(_) => None,
-                    };
+                    let data = commit_log.read().ok();
                     let mut message = ResponseMessage::ResponseWithBody;
                     if data.is_none() || data.clone().unwrap().is_empty() {
                         message = ResponseMessage::NoNewMessages;

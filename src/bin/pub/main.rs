@@ -21,7 +21,7 @@ async fn main() -> Result<(), io::Error> {
             .unwrap();
 
         id += 1;
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;
 
         // if id == 10 {
         // break;
